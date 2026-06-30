@@ -339,6 +339,7 @@ async def get_current_user(
 
     # auth by api key
     if token.startswith('sk-'):
+        request.state.auth_type = 'api_key'
         user = await get_current_user_by_api_key(request, token)
 
         # Add user info to current span
@@ -356,6 +357,7 @@ async def get_current_user(
 
     # auth by jwt token
     try:
+        request.state.auth_type = 'jwt'
         try:
             data = decode_token(token)
         except Exception as e:
