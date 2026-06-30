@@ -384,8 +384,10 @@
 		webSearchEnabled = false;
 		imageGenerationEnabled = false;
 		codeInterpreterEnabled = false;
-
-		if (selectedModelIds.filter((id) => id).length > 0) {
+	
+		const activeModelIds = atSelectedModel?.id ? [atSelectedModel.id] : selectedModels;
+	
+		if (activeModelIds.filter((id) => id).length > 0) {
 			await setDefaults();
 		}
 	};
