@@ -1429,7 +1429,10 @@
 			}
 
 			// Unavailable & hidden models filtering
-			selectedModels = selectedModels.filter((modelId) => availableModels.includes(modelId));
+			// Do not filter if models have not loaded yet; otherwise saved defaults get dropped.
+			if (availableModels.length > 0) {
+				selectedModels = selectedModels.filter((modelId) => availableModels.includes(modelId));
+			}
 		}
 
 		// Ensure at least one model is selected
@@ -1576,9 +1579,12 @@
 			}
 		}
 
-		selectedModels = selectedModels.map((modelId) =>
-			$models.map((m) => m.id).includes(modelId) ? modelId : ''
-		);
+		const loadedModelIds = $models.map((m) => m.id);
+		if (loadedModelIds.length > 0) {
+			selectedModels = selectedModels.map((modelId) =>
+				loadedModelIds.includes(modelId) ? modelId : ''
+			);
+		}
 
 		const chatInput = document.getElementById('chat-input');
 		setTimeout(() => chatInput?.focus(), 0);
