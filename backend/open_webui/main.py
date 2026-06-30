@@ -974,6 +974,570 @@ async def unload_model(request: Request, form_data: ModelUnloadForm, user=Depend
     raise HTTPException(status_code=404, detail=f'Model "{model_id}" not found')
 
 
+
+##################################
+# Raw API Internal Tool Loop
+##################################
+
+
+def _is_raw_api_key_chat_request(request: Request, metadata: dict) -> bool:
+    """True for raw API-key callers, false for the Open WebUI browser UI."""
+    return getattr(request.state, 'auth_type', None) == 'api_key' and not metadata.get('session_id')
+
+
+def _get_message_tool_calls(response: dict) -> list:
+    try:
+        choice = (response.get('choices') or [{}])[0]
+        message = choice.get('message') or {}
+        return message.get('tool_calls') or []
+    except Exception:
+        return []
+
+
+def _response_finish_reason(response: dict) -> str | None:
+    try:
+        return (response.get('choices') or [{}])[0].get('finish_reason')
+    except Exception:
+        return None
+
+
+def _is_internal_auto_tool(tool: dict, allowed_tool_ids: set[str]) -> bool:
+    """Auto-run only Open WebUI-resolved tools allowed on the active model/request.
+
+    This includes Python tools plus server-side MCP/external tools once Open
+    WebUI has resolved them into callables. Direct/client-side tools are not
+    auto-run because raw API clients do not have the browser/event channel that
+    executes them.
+    """
+    if not tool:
+        return False
+    if tool.get('direct'):
+        return False
+    if not tool.get('callable'):
+        return False
+
+    tool_id = tool.get('tool_id')
+    if tool_id:
+        return tool_id in allowed_tool_ids
+
+    # MCP tools are expanded from server:mcp:<id> into names such as
+    # <server_id>_<tool_name> and may not carry tool_id on the expanded entry.
+    # They only exist in metadata['tools'] after a requested/allowed MCP server
+    # has been resolved by Open WebUI, so a callable MCP entry is allowed here.
+    if tool.get('type') == 'mcp':
+        return True
+
+    # Builtin/server-resolved tools may not have tool_id but are still safe to
+    # run when Open WebUI placed them in metadata['tools'] for this request.
+    return tool.get('type') in {'builtin', 'function', 'external'}
+
+
+def _stringify_tool_result(result) -> str:
+    if isinstance(result, tuple):
+        result = result[0] if result else ''
+    if isinstance(result, str):
+        return result
+    try:
+        return json.dumps(result, ensure_ascii=False)
+    except Exception:
+        return str(result)
+
+
+async def _collect_openai_streaming_response(response: StreamingResponse) -> dict:
+    """Consume an OpenAI-style SSE stream and merge deltas into one response dict."""
+    merged_message = {'role': 'assistant', 'content': ''}
+    reasoning = ''
+    tool_calls_by_index = {}
+    finish_reason = None
+    response_id = None
+    model = None
+    created = int(time.time())
+
+    async for chunk in response.body_iterator:
+        text = chunk.decode('utf-8', 'replace') if isinstance(chunk, (bytes, bytearray)) else str(chunk)
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line.startswith('data:'):
+                continue
+            data = line[5:].strip()
+            if not data or data == '[DONE]':
+                continue
+            try:
+                payload = json.loads(data)
+            except Exception:
+                continue
+
+            response_id = response_id or payload.get('id')
+            model = model or payload.get('model')
+            created = payload.get('created') or created
+            choice = (payload.get('choices') or [{}])[0]
+            finish_reason = choice.get('finish_reason') or finish_reason
+            delta = choice.get('delta') or choice.get('message') or {}
+
+            if delta.get('role'):
+                merged_message['role'] = delta['role']
+            if delta.get('content'):
+                merged_message['content'] += delta['content']
+            if delta.get('reasoning'):
+                reasoning += delta['reasoning']
+
+            for tool_delta in delta.get('tool_calls') or []:
+                idx = tool_delta.get('index', 0)
+                existing = tool_calls_by_index.setdefault(
+                    idx,
+                    {
+                        'id': '',
+                        'type': 'function',
+                        'function': {'name': '', 'arguments': ''},
+                    },
+                )
+                if tool_delta.get('id'):
+                    existing['id'] += tool_delta['id']
+                if tool_delta.get('type'):
+                    existing['type'] = tool_delta['type']
+                fn = tool_delta.get('function') or {}
+                if fn.get('name'):
+                    existing['function']['name'] += fn['name']
+                if fn.get('arguments'):
+                    existing['function']['arguments'] += fn['arguments']
+
+    if response.background is not None:
+        await response.background()
+
+    if reasoning:
+        merged_message['reasoning'] = reasoning
+    if tool_calls_by_index:
+        merged_message['tool_calls'] = [tool_calls_by_index[i] for i in sorted(tool_calls_by_index.keys())]
+
+    return {
+        'id': response_id or f'chatcmpl-{uuid4()}',
+        'object': 'chat.completion',
+        'created': created,
+        'model': model,
+        'choices': [{'index': 0, 'message': merged_message, 'finish_reason': finish_reason}],
+    }
+
+
+def _openai_stream_chunk(base: dict, delta: dict, finish_reason=None) -> str:
+    chunk = {
+        **base,
+        'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish_reason}],
+    }
+    return f'data: {json.dumps(chunk, ensure_ascii=False)}\n\n'
+
+
+def _needs_raw_api_separator(previous_char: str, next_text: str) -> bool:
+    return bool(previous_char and not previous_char.isspace() and next_text and not next_text[0].isspace())
+
+
+def _join_raw_api_text(prefix: str, suffix: str, separator: str = '\n\n') -> str:
+    if not prefix:
+        return suffix or ''
+    if not suffix:
+        return prefix or ''
+    if prefix[-1].isspace() or suffix[0].isspace():
+        return prefix + suffix
+    return prefix + separator + suffix
+
+
+def _separator_for_raw_api_kind_transition(previous_kind: str, current_kind: str, previous_char: str, next_text: str) -> str:
+    # Keep chunks of the same field untouched, but make boundaries readable:
+    # reasoning -> content, content/reasoning -> post-tool continuation, etc.
+    if not previous_kind or previous_kind == current_kind:
+        return ''
+    if not _needs_raw_api_separator(previous_char, next_text):
+        return ''
+    return '\n\n'
+
+
+def _reorder_raw_api_message_fields(message: dict) -> dict:
+    # JSON object ordering is not semantic, but many raw CLI clients print fields
+    # in order. Put reasoning before content so non-streaming responses read like
+    # the streamed experience: thought first, answer second.
+    ordered = {}
+    for key in ('role', 'reasoning', 'reasoning_content', 'content', 'tool_calls'):
+        if key in message:
+            ordered[key] = message[key]
+    for key, value in message.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
+
+
+def _merge_raw_api_final_message(final_response: dict, prior_messages: list[dict]) -> dict:
+    """For non-streaming raw API calls, preserve text/reasoning in read order.
+
+    Non-streaming JSON object order is not reliable in real clients, and many
+    CLI/proxy clients print message.content before message.reasoning even if the
+    JSON fields are ordered the other way. To make raw API behavior predictable,
+    materialize reasoning before the final answer in content and remove the
+    separate reasoning fields after doing so. Streaming still emits reasoning and
+    content as separate deltas in provider order.
+    """
+    try:
+        choice = (final_response.get('choices') or [{}])[0]
+        final_message = choice.setdefault('message', {})
+    except Exception:
+        return final_response
+
+    prior_content = ''
+    prior_reasoning = ''
+    for message in prior_messages or []:
+        if message.get('content'):
+            prior_content = _join_raw_api_text(prior_content, message.get('content') or '')
+        if message.get('reasoning'):
+            prior_reasoning = _join_raw_api_text(prior_reasoning, message.get('reasoning') or '')
+        if message.get('reasoning_content'):
+            prior_reasoning = _join_raw_api_text(prior_reasoning, message.get('reasoning_content') or '')
+
+    final_content = final_message.get('content') or ''
+    final_reasoning = _join_raw_api_text(
+        final_message.get('reasoning') or '',
+        final_message.get('reasoning_content') or '',
+    )
+
+    content_parts = []
+    if prior_reasoning:
+        content_parts.append(prior_reasoning)
+    if prior_content:
+        content_parts.append(prior_content)
+    if final_reasoning:
+        content_parts.append(final_reasoning)
+    if final_content:
+        content_parts.append(final_content)
+
+    if content_parts:
+        materialized_content = ''
+        for part in content_parts:
+            materialized_content = _join_raw_api_text(materialized_content, part)
+        final_message['content'] = materialized_content
+
+    # Avoid clients printing content and then reasoning, which makes
+    # non-streaming output look backwards. The reasoning has already been
+    # materialized before content above.
+    final_message.pop('reasoning', None)
+    final_message.pop('reasoning_content', None)
+    choice['message'] = _reorder_raw_api_message_fields(final_message)
+
+    return final_response
+
+
+def _dict_to_openai_sse(response: dict):
+    async def event_generator():
+        choice = (response.get('choices') or [{}])[0]
+        message = choice.get('message') or {}
+        base = {
+            'id': response.get('id'),
+            'object': 'chat.completion.chunk',
+            'created': response.get('created', int(time.time())),
+            'model': response.get('model'),
+        }
+
+        yield _openai_stream_chunk(base, {'role': message.get('role') or 'assistant'}, None)
+
+        reasoning_value = message.get('reasoning') or message.get('reasoning_content')
+        reasoning_key = 'reasoning' if message.get('reasoning') is not None else 'reasoning_content'
+        if reasoning_value:
+            yield _openai_stream_chunk(base, {reasoning_key: reasoning_value}, None)
+        if message.get('content'):
+            content = message.get('content')
+            if reasoning_value and _needs_raw_api_separator(str(reasoning_value)[-1], content):
+                content = '\n\n' + content
+            yield _openai_stream_chunk(base, {'content': content}, None)
+
+        for idx, tool_call in enumerate(message.get('tool_calls') or []):
+            tc = {
+                'index': idx,
+                'id': tool_call.get('id'),
+                'type': tool_call.get('type') or 'function',
+                'function': tool_call.get('function') or {},
+            }
+            yield _openai_stream_chunk(base, {'tool_calls': [tc]}, None)
+
+        yield _openai_stream_chunk(base, {}, choice.get('finish_reason') or 'stop')
+        yield 'data: [DONE]\n\n'
+
+    return StreamingResponse(event_generator(), media_type='text/event-stream')
+
+
+async def _execute_raw_api_tool_calls(
+    form_data: dict,
+    tools: dict,
+    tool_calls: list,
+) -> None:
+    assistant_message = form_data.pop('_raw_api_pending_assistant_message')
+    form_data.setdefault('messages', []).append(assistant_message)
+
+    for tool_call in tool_calls:
+        call_id = tool_call.get('id') or str(uuid4())
+        function = tool_call.get('function') or {}
+        name = function.get('name')
+        tool = tools[name]
+        try:
+            args = json.loads(function.get('arguments') or '{}')
+            if not isinstance(args, dict):
+                raise ValueError('Tool arguments must decode to a JSON object')
+
+            allowed_params = (tool.get('spec', {}).get('parameters', {}).get('properties') or {}).keys()
+            if allowed_params:
+                args = {k: v for k, v in args.items() if k in allowed_params}
+
+            # Match WebUI behavior: do not impose an extra timeout here. Any
+            # timeout should come from the underlying tool/server configuration.
+            result = await tool['callable'](**args)
+            content = _stringify_tool_result(result)
+            log.info(f'Raw API internal tool succeeded: {name}')
+        except Exception as e:
+            content = json.dumps({'error': str(e)}, ensure_ascii=False)
+            log.warning(f'Raw API internal tool failed: {name}: {e}')
+
+        form_data['messages'].append(
+            {
+                'role': 'tool',
+                'tool_call_id': call_id,
+                'name': name,
+                'content': content,
+            }
+        )
+
+
+async def _stream_raw_api_internal_tool_loop(
+    request: Request,
+    form_data: dict,
+    user,
+    metadata: dict,
+    response,
+):
+    """Stream one continuous response while internally looping over tools.
+
+    Text/reasoning chunks are forwarded as they arrive. Tool-call chunks are
+    buffered until the model finishes the turn; runnable internal tools are then
+    executed and the next model invocation is streamed into the same SSE
+    response. If the model asks for a non-runnable/client-side tool, the raw
+    tool_call is streamed back so the API client can handle it.
+    """
+    allowed_tool_ids = set(metadata.get('tool_ids') or [])
+    tools = metadata.get('tools') or {}
+    working_response = response
+    depth = 0
+    last_emitted_char = ''
+    last_emitted_kind = ''
+    insert_separator_before_next_text = False
+
+    while True:
+        depth += 1
+        merged_message = {'role': 'assistant', 'content': ''}
+        reasoning = ''
+        tool_calls_by_index = {}
+        finish_reason = None
+        response_id = None
+        model_name = form_data.get('model')
+        created = int(time.time())
+
+        if not isinstance(working_response, StreamingResponse):
+            working_response = _dict_to_openai_sse(working_response)
+
+        async for chunk in working_response.body_iterator:
+            text = chunk.decode('utf-8', 'replace') if isinstance(chunk, (bytes, bytearray)) else str(chunk)
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if not line.startswith('data:'):
+                    continue
+                data = line[5:].strip()
+                if not data or data == '[DONE]':
+                    continue
+                try:
+                    payload = json.loads(data)
+                except Exception:
+                    continue
+
+                response_id = response_id or payload.get('id') or f'chatcmpl-{uuid4()}'
+                model_name = payload.get('model') or model_name
+                created = payload.get('created') or created
+                base = {
+                    'id': response_id,
+                    'object': 'chat.completion.chunk',
+                    'created': created,
+                    'model': model_name,
+                }
+
+                choice = (payload.get('choices') or [{}])[0]
+                finish_reason = choice.get('finish_reason') or finish_reason
+                delta = choice.get('delta') or choice.get('message') or {}
+
+                passthrough_delta = {}
+                if delta.get('role'):
+                    merged_message['role'] = delta['role']
+                    passthrough_delta['role'] = delta['role']
+                reasoning_key = 'reasoning' if delta.get('reasoning') is not None else (
+                    'reasoning_content' if delta.get('reasoning_content') is not None else None
+                )
+                if reasoning_key:
+                    reasoning_delta = delta[reasoning_key]
+                    if insert_separator_before_next_text and _needs_raw_api_separator(last_emitted_char, reasoning_delta):
+                        reasoning_delta = '\n\n' + reasoning_delta
+                    else:
+                        reasoning_delta = (
+                            _separator_for_raw_api_kind_transition(
+                                last_emitted_kind, 'reasoning', last_emitted_char, reasoning_delta
+                            )
+                            + reasoning_delta
+                        )
+                    insert_separator_before_next_text = False
+                    reasoning += reasoning_delta
+                    passthrough_delta[reasoning_key] = reasoning_delta
+                    if reasoning_delta:
+                        last_emitted_char = reasoning_delta[-1]
+                        last_emitted_kind = 'reasoning'
+
+                if delta.get('content'):
+                    content_delta = delta['content']
+                    if insert_separator_before_next_text and _needs_raw_api_separator(last_emitted_char, content_delta):
+                        content_delta = '\n\n' + content_delta
+                    else:
+                        content_delta = (
+                            _separator_for_raw_api_kind_transition(
+                                last_emitted_kind, 'content', last_emitted_char, content_delta
+                            )
+                            + content_delta
+                        )
+                    insert_separator_before_next_text = False
+                    merged_message['content'] += content_delta
+                    passthrough_delta['content'] = content_delta
+                    if content_delta:
+                        last_emitted_char = content_delta[-1]
+                        last_emitted_kind = 'content'
+
+                for tool_delta in delta.get('tool_calls') or []:
+                    idx = tool_delta.get('index', 0)
+                    existing = tool_calls_by_index.setdefault(
+                        idx,
+                        {
+                            'id': '',
+                            'type': 'function',
+                            'function': {'name': '', 'arguments': ''},
+                        },
+                    )
+                    if tool_delta.get('id'):
+                        existing['id'] += tool_delta['id']
+                    if tool_delta.get('type'):
+                        existing['type'] = tool_delta['type']
+                    fn = tool_delta.get('function') or {}
+                    if fn.get('name'):
+                        existing['function']['name'] += fn['name']
+                    if fn.get('arguments'):
+                        existing['function']['arguments'] += fn['arguments']
+
+                if passthrough_delta:
+                    yield _openai_stream_chunk(base, passthrough_delta, None)
+                elif finish_reason and finish_reason != 'tool_calls':
+                    yield _openai_stream_chunk(base, {}, finish_reason)
+
+        if working_response.background is not None:
+            await working_response.background()
+
+        if reasoning:
+            merged_message['reasoning'] = reasoning
+        tool_calls = [tool_calls_by_index[i] for i in sorted(tool_calls_by_index.keys())]
+        if tool_calls:
+            merged_message['tool_calls'] = tool_calls
+
+        if not tool_calls or finish_reason != 'tool_calls':
+            yield 'data: [DONE]\n\n'
+            return
+
+        requested_names = [(tc.get('function') or {}).get('name') for tc in tool_calls]
+        for name in requested_names:
+            if not _is_internal_auto_tool(tools.get(name), allowed_tool_ids):
+                log.info(f'Raw API tool loop bypassed; tool not auto-runnable: {name}')
+                base = {
+                    'id': response_id or f'chatcmpl-{uuid4()}',
+                    'object': 'chat.completion.chunk',
+                    'created': created,
+                    'model': model_name,
+                }
+                for idx, tool_call in enumerate(tool_calls):
+                    tc = {
+                        'index': idx,
+                        'id': tool_call.get('id'),
+                        'type': tool_call.get('type') or 'function',
+                        'function': tool_call.get('function') or {},
+                    }
+                    yield _openai_stream_chunk(base, {'tool_calls': [tc]}, None)
+                yield _openai_stream_chunk(base, {}, 'tool_calls')
+                yield 'data: [DONE]\n\n'
+                return
+
+        log.info(f'Raw API internal tool loop streaming: depth={depth}, tools={requested_names}')
+        form_data['_raw_api_pending_assistant_message'] = merged_message
+        await _execute_raw_api_tool_calls(form_data, tools, tool_calls)
+        insert_separator_before_next_text = True
+
+        loop_form_data = {k: v for k, v in form_data.items() if not k.startswith('_raw_api_')}
+        loop_form_data['stream'] = True
+        working_response = await chat_completion_handler(request, loop_form_data, user)
+
+
+async def _maybe_run_raw_api_internal_tool_loop(
+    request: Request,
+    form_data: dict,
+    user,
+    metadata: dict,
+    model: dict,
+    response,
+):
+    """Execute allowed internal tools for raw API-key callers only.
+
+    Applies to both streaming and non-streaming raw API requests. Unknown,
+    client-side, user-provided, or disallowed tools are returned unchanged.
+    """
+    if not _is_raw_api_key_chat_request(request, metadata):
+        return response
+    if form_data.get('metadata', {}).get('payload_tools_provided'):
+        return response
+
+    allowed_tool_ids = set(metadata.get('tool_ids') or [])
+    tools = metadata.get('tools') or {}
+    if not allowed_tool_ids or not tools:
+        return response
+
+    if form_data.get('stream'):
+        return StreamingResponse(
+            _stream_raw_api_internal_tool_loop(request, form_data, user, metadata, response),
+            media_type='text/event-stream',
+        )
+
+    working_response = await _collect_openai_streaming_response(response) if isinstance(response, StreamingResponse) else response
+    if not isinstance(working_response, dict):
+        return response
+
+    depth = 0
+    prior_assistant_tool_messages = []
+    while True:
+        depth += 1
+        tool_calls = _get_message_tool_calls(working_response)
+        if not tool_calls or _response_finish_reason(working_response) != 'tool_calls':
+            return _merge_raw_api_final_message(working_response, prior_assistant_tool_messages)
+
+        requested_names = [(tc.get('function') or {}).get('name') for tc in tool_calls]
+        for name in requested_names:
+            if not _is_internal_auto_tool(tools.get(name), allowed_tool_ids):
+                log.info(f'Raw API tool loop bypassed; tool not auto-runnable: {name}')
+                return working_response
+
+        log.info(f'Raw API internal tool loop non-streaming: depth={depth}, tools={requested_names}')
+        assistant_message = (working_response.get('choices') or [{}])[0].get('message') or {}
+        prior_assistant_tool_messages.append(assistant_message)
+        form_data['_raw_api_pending_assistant_message'] = assistant_message
+        await _execute_raw_api_tool_calls(form_data, tools, tool_calls)
+
+        loop_form_data = {k: v for k, v in form_data.items() if not k.startswith('_raw_api_')}
+        loop_form_data['stream'] = False
+        working_response = await chat_completion_handler(request, loop_form_data, user)
+        if isinstance(working_response, StreamingResponse):
+            working_response = await _collect_openai_streaming_response(working_response)
+
+
 ##################################
 # Embeddings
 ##################################
@@ -1127,6 +1691,18 @@ async def chat_completion(
         ):
             tool_servers = None
 
+        payload_tools_provided = 'tools' in form_data
+        is_raw_api_key_request = getattr(request.state, 'auth_type', None) == 'api_key' and not form_data.get(
+            'session_id'
+        )
+        if is_raw_api_key_request and not payload_tools_provided and not form_data.get('tool_ids'):
+            model_tool_ids = model.get('info', {}).get('meta', {}).get('toolIds') or []
+            if model_tool_ids:
+                form_data['tool_ids'] = model_tool_ids
+                log.info(
+                    f'Raw API request: enabling model internal tools for auto-loop: {model_tool_ids}'
+                )
+
         metadata = {
             'user_id': user.id,
             'user_agent': request.headers.get('user-agent', '') or '',
@@ -1138,6 +1714,7 @@ async def chat_completion(
             'folder_id': form_data.pop('folder_id', None),
             'filter_ids': form_data.pop('filter_ids', []),
             'tool_ids': form_data.get('tool_ids', None),
+            'payload_tools_provided': payload_tools_provided,
             'tool_servers': tool_servers,
             'files': form_data.get('files', None),
             'features': form_data.get('features', {}),
@@ -1467,6 +2044,15 @@ async def chat_completion(
             form_data, metadata, events = await process_chat_payload(request, form_data, user, metadata, model)
 
             response = await chat_completion_handler(request, form_data, user)
+
+            response = await _maybe_run_raw_api_internal_tool_loop(
+                request,
+                form_data,
+                user,
+                metadata,
+                model,
+                response,
+            )
 
             # When the upstream provider returns an error (e.g. HTTP 400
             # content-filter, quota exceeded), generate_chat_completion
