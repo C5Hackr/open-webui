@@ -291,8 +291,11 @@
 			if (storageChatInput) {
 				try {
 					const input = JSON.parse(storageChatInput);
+					const hasActualDraft = Boolean(
+						(input.prompt ?? '').trim() || ((input.files ?? []).length > 0)
+					);
 
-					if (!$temporaryChatEnabled) {
+					if (!$temporaryChatEnabled && hasActualDraft) {
 						messageInput?.setText(input.prompt);
 						files = input.files;
 						selectedToolIds = input.selectedToolIds;
@@ -301,8 +304,13 @@
 						webSearchEnabled = input.webSearchEnabled;
 						imageGenerationEnabled = input.imageGenerationEnabled;
 						codeInterpreterEnabled = input.codeInterpreterEnabled;
+					} else {
+						sessionStorage.removeItem(`chat-input${chatIdProp ? `-${chatIdProp}` : ''}`);
+						await setDefaults();
 					}
-				} catch (e) {}
+				} catch (e) {
+					await setDefaults();
+				}
 			} else {
 				await setDefaults();
 			}
@@ -1588,8 +1596,11 @@
 		if (storageChatInput) {
 			try {
 				const input = JSON.parse(storageChatInput);
+				const hasActualDraft = Boolean(
+					(input.prompt ?? '').trim() || ((input.files ?? []).length > 0)
+				);
 
-				if (!$temporaryChatEnabled) {
+				if (!$temporaryChatEnabled && hasActualDraft) {
 					prompt = input.prompt ?? '';
 					messageInput?.setText(prompt);
 					files = input.files ?? [];
@@ -1605,6 +1616,8 @@
 					webSearchEnabled = input.webSearchEnabled ?? webSearchEnabled;
 					imageGenerationEnabled = input.imageGenerationEnabled ?? imageGenerationEnabled;
 					codeInterpreterEnabled = input.codeInterpreterEnabled ?? codeInterpreterEnabled;
+				} else {
+					sessionStorage.removeItem('chat-input');
 				}
 			} catch (e) {}
 		}
@@ -3018,15 +3031,22 @@
 			clearTimeout(saveDraftTimeout);
 		}
 
+		const storageKey = `chat-input${chatId ? `-${chatId}` : ''}`;
+		const hasActualDraft = Boolean(
+			(draft.prompt ?? '').trim() || ((draft.files ?? []).length > 0)
+		);
+
+		if (!hasActualDraft) {
+			sessionStorage.removeItem(storageKey);
+			return;
+		}
+
 		if (draft.prompt !== null && draft.prompt.length < MAX_DRAFT_LENGTH) {
 			saveDraftTimeout = setTimeout(async () => {
-				await sessionStorage.setItem(
-					`chat-input${chatId ? `-${chatId}` : ''}`,
-					JSON.stringify(draft)
-				);
+				await sessionStorage.setItem(storageKey, JSON.stringify(draft));
 			}, 500);
 		} else {
-			sessionStorage.removeItem(`chat-input${chatId ? `-${chatId}` : ''}`);
+			sessionStorage.removeItem(storageKey);
 		}
 	};
 
