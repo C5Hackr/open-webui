@@ -802,7 +802,6 @@
 		if (window.location.pathname === '/auth') {
 			user.set(null);
 			localStorage.removeItem('token');
-			sessionStorage.clear();
 			loaded = true;
 			document.getElementById('splash-screen')?.remove();
 			return;
@@ -960,6 +959,7 @@
 			const response = await originalFetch(input, init);
 
 			if (
+				window.location.pathname !== '/auth' &&
 				response.status === 401 &&
 				localStorage.token &&
 				isAuthenticatedBackendFetch(input, init) &&
