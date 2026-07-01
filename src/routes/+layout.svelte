@@ -795,19 +795,21 @@
 	};
 
 	const redirectToAuthAfterUnauthorized = () => {
-		if (isAuthRedirectInProgress || window.location.pathname === '/auth') {
+		if (isAuthRedirectInProgress) {
 			return;
 		}
-
+	
 		isAuthRedirectInProgress = true;
 		user.set(null);
 		localStorage.removeItem('token');
-		toast.error($i18n.t('Session expired. Please sign in again.'));
-
+		sessionStorage.clear();
+	
 		const currentPath = `${window.location.pathname}${window.location.search}`;
-		goto(`/auth?redirect=${encodeURIComponent(currentPath)}`).finally(() => {
-			isAuthRedirectInProgress = false;
-		});
+		const redirectUrl = `/auth?redirect=${encodeURIComponent(currentPath)}`;
+	
+		if (window.location.pathname !== '/auth') {
+			window.location.replace(redirectUrl);
+		}
 	};
 
 	const isAuthFailureResponse = async (response) => {
@@ -1157,7 +1159,9 @@
 					} else {
 						// Redirect Invalid Session User to /auth Page
 						localStorage.removeItem('token');
-						await goto(`/auth?redirect=${encodedUrl}`);
+						sessionStorage.clear();
+						window.location.replace(`/auth?redirect=${encodedUrl}`);
+						return;
 					}
 				} else {
 					// Don't redirect if we're already on the auth page
