@@ -376,6 +376,19 @@
 		oldSelectedModelIds = structuredClone(selectedModelIds);
 	};
 
+	const waitForSelectedModel = async (modelIds: string[]) => {
+		for (let i = 0; i < 30; i++) {
+			if (modelIds.some((id) => $models.find((m) => m.id === id))) {
+				return true;
+			}
+	
+			await tick();
+			await new Promise((resolve) => requestAnimationFrame(resolve));
+		}
+	
+		return false;
+	};
+
 	const resetInput = async () => {
 		selectedToolIds = [];
 		selectedSkillIds = [];
@@ -386,8 +399,9 @@
 		codeInterpreterEnabled = false;
 	
 		const activeModelIds = atSelectedModel?.id ? [atSelectedModel.id] : selectedModels;
+		const validModelIds = activeModelIds.filter((id) => id);
 	
-		if (activeModelIds.filter((id) => id).length > 0) {
+		if (validModelIds.length > 0 && (await waitForSelectedModel(validModelIds))) {
 			await setDefaults();
 		}
 	};
