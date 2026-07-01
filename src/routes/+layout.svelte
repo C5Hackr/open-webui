@@ -799,6 +799,15 @@
 			return;
 		}
 	
+		if (window.location.pathname === '/auth') {
+			user.set(null);
+			localStorage.removeItem('token');
+			sessionStorage.clear();
+			loaded = true;
+			document.getElementById('splash-screen')?.remove();
+			return;
+		}
+	
 		isAuthRedirectInProgress = true;
 		user.set(null);
 		localStorage.removeItem('token');
@@ -807,9 +816,7 @@
 		const currentPath = `${window.location.pathname}${window.location.search}`;
 		const redirectUrl = `/auth?redirect=${encodeURIComponent(currentPath)}`;
 	
-		if (window.location.pathname !== '/auth') {
-			window.location.replace(redirectUrl);
-		}
+		window.location.replace(redirectUrl);
 	};
 
 	const isAuthFailureResponse = async (response) => {
@@ -1160,8 +1167,11 @@
 						// Redirect Invalid Session User to /auth Page
 						localStorage.removeItem('token');
 						sessionStorage.clear();
-						window.location.replace(`/auth?redirect=${encodedUrl}`);
-						return;
+						
+						if ($page.url.pathname !== '/auth') {
+							window.location.replace(`/auth?redirect=${encodedUrl}`);
+							return;
+						}
 					}
 				} else {
 					// Don't redirect if we're already on the auth page
