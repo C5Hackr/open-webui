@@ -421,19 +421,24 @@
 
 		try {
 			if (!$tools) {
-				tools.set(await getTools(localStorage.token));
+				await tools.set(await getTools(localStorage.token));
+				await tick();
 			}
 			if (!$functions) {
-				functions.set(await getFunctions(localStorage.token));
+				await functions.set(await getFunctions(localStorage.token));
 			}
 			if (!$skills) {
-				skills.set(await getSkills(localStorage.token));
+				await skills.set(await getSkills(localStorage.token));
 			}
 			if (selectedModels.length !== 1 && !atSelectedModel) {
 				return;
 			}
-
+			
 			const model = atSelectedModel ?? $models.find((m) => m.id === selectedModels[0]);
+			if (!model || !$tools) {
+				return;
+			}
+			
 			if (model) {
 				// Set Default Tools
 				if (model?.info?.meta?.toolIds) {
