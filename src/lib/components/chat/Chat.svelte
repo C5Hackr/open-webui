@@ -272,7 +272,6 @@
 
 		if (chatIdProp && (await loadChat())) {
 			await tick();
-			loading = false;
 			window.setTimeout(() => scrollToBottom(), 0);
 
 			await tick();
@@ -308,6 +307,8 @@
 				await setDefaults();
 			}
 
+			await tick();
+			loading = false;
 			const chatInput = document.getElementById('chat-input');
 			chatInput?.focus();
 		} else {
@@ -377,32 +378,7 @@
 		oldSelectedModelIds = structuredClone(selectedModelIds);
 	};
 
-
-	const resetInput = async () => {
-		selectedToolIds = [];
-		selectedSkillIds = [];
-		selectedFilterIds = [];
-		pendingOAuthTools = [];
-		webSearchEnabled = false;
-		imageGenerationEnabled = false;
-		codeInterpreterEnabled = false;
-
-		const activeModelIds = atSelectedModel?.id ? [atSelectedModel.id] : selectedModels;
-		const validModelIds = activeModelIds.filter((id) => id);
-
-		if (validModelIds.length > 0) {
-			await setDefaults();
-		}
-	};
-
-	/** Check whether a terminal ID references an available system or direct terminal. */
-	const isTerminalAvailable = (tid: string): boolean => {
-		return (
-			($terminalServers ?? []).some((t) => t.id && t.id === tid) ||
-			($settings?.terminalServers ?? []).some((s) => s.url === tid)
-		);
-	};
-
+	let resettingInput: Promise<void> | null = null;
 
 	const ensureDefaultDependencies = async () => {
 		if ($models.length === 0) {
@@ -433,23 +409,54 @@
 		}
 	};
 
-	let settingDefaults = false;
-	const setDefaults = async () => {
-		if (settingDefaults) return;
-		settingDefaults = true;
+	const resetInput = async () => {
+		if (resettingInput) {
+			return resettingInput;
+		}
 
-		try {
-			await ensureDefaultDependencies();
+		resettingInput = (async () => {
+			selectedToolIds = [];
+			selectedSkillIds = [];
+			selectedFilterIds = [];
+			pendingOAuthTools = [];
+			webSearchEnabled = false;
+			imageGenerationEnabled = false;
+			codeInterpreterEnabled = false;
+
+			const activeModelIds = atSelectedModel?.id ? [atSelectedModel.id] : selectedModels;
+			const validModelIds = activeModelIds.filter((id) => id);
+
+			if (validModelIds.length > 0) {
+				await ensureDefaultDependencies();
+				await setDefaults();
+			}
+		})().finally(() => {
+			resettingInput = null;
+		});
+
+		return resettingInput;
+	};
+
+	/** Check whether a terminal ID references an available system or direct terminal. */
+	const isTerminalAvailable = (tid: string): boolean => {
+		return (
+			($terminalServers ?? []).some((t) => t.id && t.id === tid) ||
+			($settings?.terminalServers ?? []).some((s) => s.url === tid)
+		);
+	};
+
+	const setDefaults = async () => {
+		await ensureDefaultDependencies();
 
 			if (selectedModels.length !== 1 && !atSelectedModel) {
 				return;
 			}
-
+			
 			const model = atSelectedModel ?? $models.find((m) => m.id === selectedModels[0]);
 			if (!model || !$tools) {
 				return;
 			}
-
+			
 			if (model) {
 				// Set Default Tools
 				if (model?.info?.meta?.toolIds) {
@@ -540,9 +547,6 @@
 					}
 				}
 			}
-		} finally {
-			settingDefaults = false;
-		}
 	};
 
 	const showMessage = async (message, scroll = true, save = true) => {
@@ -1020,48 +1024,7 @@
 			}
 		});
 
-		const storageChatInput = sessionStorage.getItem(
-			`chat-input${chatIdProp ? `-${chatIdProp}` : ''}`
-		);
-
-		const init = async () => {
-			if (!chatIdProp) {
-				await tick();
-			}
-
-			if (storageChatInput) {
-				prompt = '';
-				messageInput?.setText('');
-
-				files = [];
-				selectedToolIds = [];
-				selectedSkillIds = [];
-				selectedFilterIds = [];
-				webSearchEnabled = false;
-				imageGenerationEnabled = false;
-				codeInterpreterEnabled = false;
-
-				try {
-					const input = JSON.parse(storageChatInput);
-
-					if (!$temporaryChatEnabled) {
-						messageInput?.setText(input.prompt);
-						files = input.files;
-						selectedToolIds = input.selectedToolIds;
-						selectedSkillIds = input.selectedSkillIds ?? [];
-						selectedFilterIds = input.selectedFilterIds;
-						webSearchEnabled = input.webSearchEnabled;
-						imageGenerationEnabled = input.imageGenerationEnabled;
-						codeInterpreterEnabled = input.codeInterpreterEnabled;
-					}
-				} catch (e) {}
-			}
-
-			const chatInput = document.getElementById('chat-input');
-			chatInput?.focus();
-		};
-		init();
-
+		
 		return () => {
 			try {
 				clearTimeout(saveControlsTimer);
@@ -1621,6 +1584,32 @@
 			);
 		}
 
+		const storageChatInput = sessionStorage.getItem('chat-input');
+		if (storageChatInput) {
+			try {
+				const input = JSON.parse(storageChatInput);
+
+				if (!$temporaryChatEnabled) {
+					prompt = input.prompt ?? '';
+					messageInput?.setText(prompt);
+					files = input.files ?? [];
+					if ((input.selectedToolIds ?? []).length > 0) {
+						selectedToolIds = input.selectedToolIds;
+					}
+					if ((input.selectedSkillIds ?? []).length > 0) {
+						selectedSkillIds = input.selectedSkillIds;
+					}
+					if ((input.selectedFilterIds ?? []).length > 0) {
+						selectedFilterIds = input.selectedFilterIds;
+					}
+					webSearchEnabled = input.webSearchEnabled ?? webSearchEnabled;
+					imageGenerationEnabled = input.imageGenerationEnabled ?? imageGenerationEnabled;
+					codeInterpreterEnabled = input.codeInterpreterEnabled ?? codeInterpreterEnabled;
+				}
+			} catch (e) {}
+		}
+
+		await tick();
 		const chatInput = document.getElementById('chat-input');
 		chatInput?.focus();
 	};
