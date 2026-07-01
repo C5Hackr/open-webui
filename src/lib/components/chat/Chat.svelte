@@ -1609,6 +1609,15 @@
 
 		const chatInput = document.getElementById('chat-input');
 		setTimeout(() => chatInput?.focus(), 0);
+
+		// Re-apply model defaults after initial mount/model/tool stores settle.
+		// On frontpage reload, initNewChat can run before model metadata/tools are ready.
+		setTimeout(async () => {
+			const activeModelIds = atSelectedModel?.id ? [atSelectedModel.id] : selectedModels;
+			if (activeModelIds.filter((id) => id).length > 0) {
+				await resetInput();
+			}
+		}, 0);
 	};
 
 	const loadChat = async () => {
