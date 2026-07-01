@@ -91,7 +91,8 @@
 		generateMoACompletion,
 		stopTask,
 		stopTasksByChatId,
-		getTaskIdsByChatId
+		getTaskIdsByChatId,
+		getModels
 	} from '$lib/apis';
 	import { getTools } from '$lib/apis/tools';
 	import { getSkills } from '$lib/apis/skills';
@@ -376,18 +377,6 @@
 		oldSelectedModelIds = structuredClone(selectedModelIds);
 	};
 
-	const waitForSelectedModel = async (modelIds: string[]) => {
-		for (let i = 0; i < 30; i++) {
-			if (modelIds.some((id) => $models.find((m) => m.id === id))) {
-				return true;
-			}
-	
-			await tick();
-			await new Promise((resolve) => requestAnimationFrame(resolve));
-		}
-	
-		return false;
-	};
 
 	const resetInput = async () => {
 		selectedToolIds = [];
@@ -397,11 +386,11 @@
 		webSearchEnabled = false;
 		imageGenerationEnabled = false;
 		codeInterpreterEnabled = false;
-	
+
 		const activeModelIds = atSelectedModel?.id ? [atSelectedModel.id] : selectedModels;
 		const validModelIds = activeModelIds.filter((id) => id);
-	
-		if (validModelIds.length > 0 && (await waitForSelectedModel(validModelIds))) {
+
+		if (validModelIds.length > 0) {
 			await setDefaults();
 		}
 	};
@@ -414,31 +403,53 @@
 		);
 	};
 
+
+	const ensureDefaultDependencies = async () => {
+		if ($models.length === 0) {
+			await models.set(
+				await getModels(
+					localStorage.token,
+					$config?.features?.enable_direct_connections
+						? ($settings?.directConnections ?? null)
+						: null
+				)
+			);
+			await tick();
+		}
+
+		if (!$tools) {
+			await tools.set(await getTools(localStorage.token));
+			await tick();
+		}
+
+		if (!$functions) {
+			await functions.set(await getFunctions(localStorage.token));
+			await tick();
+		}
+
+		if (!$skills) {
+			await skills.set(await getSkills(localStorage.token));
+			await tick();
+		}
+	};
+
 	let settingDefaults = false;
 	const setDefaults = async () => {
 		if (settingDefaults) return;
 		settingDefaults = true;
 
 		try {
-			if (!$tools) {
-				await tools.set(await getTools(localStorage.token));
-				await tick();
-			}
-			if (!$functions) {
-				await functions.set(await getFunctions(localStorage.token));
-			}
-			if (!$skills) {
-				await skills.set(await getSkills(localStorage.token));
-			}
+			await ensureDefaultDependencies();
+
 			if (selectedModels.length !== 1 && !atSelectedModel) {
 				return;
 			}
-			
+
 			const model = atSelectedModel ?? $models.find((m) => m.id === selectedModels[0]);
 			if (!model || !$tools) {
 				return;
 			}
-			
+
 			if (model) {
 				// Set Default Tools
 				if (model?.info?.meta?.toolIds) {
@@ -970,8 +981,10 @@
 
 		const pageSubscribe = page.subscribe(async (p) => {
 			if (p.url.pathname === '/') {
+				loading = true;
 				await tick();
-				initNewChat();
+				await initNewChat();
+				loading = false;
 			}
 
 			stopAudio();
@@ -1013,7 +1026,6 @@
 
 		const init = async () => {
 			if (!chatIdProp) {
-				loading = false;
 				await tick();
 			}
 
@@ -1365,6 +1377,8 @@
 		console.log('initNewChat');
 		resetWebSearchConfirmation();
 
+		await ensureDefaultDependencies();
+
 		// Mark the outgoing chat as read before resetting; in-place created chats
 		// keep chatIdProp undefined, so navigateHandler never marks them read.
 		if ($chatId && !$temporaryChatEnabled) {
@@ -1608,16 +1622,7 @@
 		}
 
 		const chatInput = document.getElementById('chat-input');
-		setTimeout(() => chatInput?.focus(), 0);
-
-		// Re-apply model defaults after initial mount/model/tool stores settle.
-		// On frontpage reload, initNewChat can run before model metadata/tools are ready.
-		setTimeout(async () => {
-			const activeModelIds = atSelectedModel?.id ? [atSelectedModel.id] : selectedModels;
-			if (activeModelIds.filter((id) => id).length > 0) {
-				await resetInput();
-			}
-		}, 0);
+		chatInput?.focus();
 	};
 
 	const loadChat = async () => {
@@ -1631,6 +1636,8 @@
 			await goto('/');
 			return null;
 		});
+
+		await ensureDefaultDependencies();
 
 		if (chat) {
 			tags = await getTagsById(localStorage.token, $chatId).catch(async (error) => {
@@ -1711,6 +1718,7 @@
 				}
 
 				await tick();
+				await resetInput();
 
 				return true;
 			} else {
